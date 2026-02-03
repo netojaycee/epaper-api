@@ -36,3 +36,5 @@ Thumbs.db
 note.txt
 main-content-formatted works.py
 docs
+deploy copy.sh
+deploy.sh
