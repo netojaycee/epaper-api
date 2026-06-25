@@ -1,3 +1,5 @@
+import io
+import re
 import requests
 from typing import Dict, Any, Optional, List
 import logging
@@ -22,6 +24,7 @@ WP_USER = settings.wp_user
 WP_APP_PASSWORD = settings.wp_password
 WP_CATEGORIES_URL = settings.wp_categories_url
 WP_AUTHORS_URL = settings.wp_authors_url
+WP_MEDIA_URL = settings.wp_media_url
 
 # Cache for categories and authors
 _CATEGORIES_CACHE = None
@@ -470,6 +473,46 @@ def get_default_author_id() -> int:
     return 1
 
 
+def upload_image_to_wordpress(image_bytes: bytes, filename: str = "article-image.jpg") -> Optional[int]:
+    """
+    Upload raw image bytes (TIFF or JPEG) to WordPress Media Library.
+    Converts to JPEG via Pillow before uploading.
+    Returns the WordPress media ID, or None on failure.
+    """
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        logger.warning("Pillow not installed — cannot upload images. Run: pip install pillow")
+        return None
+
+    try:
+        img = PILImage.open(io.BytesIO(image_bytes))
+        if img.mode in ('CMYK', 'P', 'RGBA', 'LA'):
+            img = img.convert('RGB')
+
+        jpeg_buffer = io.BytesIO()
+        img.save(jpeg_buffer, format='JPEG', quality=85, optimize=True)
+        jpeg_bytes = jpeg_buffer.getvalue()
+
+        r = requests.post(
+            WP_MEDIA_URL,
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Type': 'image/jpeg',
+            },
+            data=jpeg_bytes,
+            auth=(WP_USER, WP_APP_PASSWORD),
+            timeout=60,
+        )
+        r.raise_for_status()
+        media_id = r.json().get('id')
+        logger.info(f"✓ Image uploaded to WordPress Media Library (ID: {media_id})")
+        return media_id
+    except Exception as e:
+        logger.error(f"✗ Image upload failed: {e}")
+        return None
+
+
 def post_to_wordpress(article: Dict[str, Any]) -> Dict[str, Any]:
     """
     Post article to WordPress automatically with category and multiple author support
@@ -493,55 +536,61 @@ def post_to_wordpress(article: Dict[str, Any]) -> Dict[str, Any]:
         # Get author IDs from article's author field (supports multiple authors)
         author_ids = get_author_ids(article.get("author", ""))
         
-        # Prepare payload for WordPress
-        # Note: WordPress REST API typically accepts 'author' as single ID or list
-        # We'll set the first author as primary and add co-authors if supported
+        # Upload featured image if provided
+        featured_media_id = None
+        image_bytes = article.get("featured_image_bytes")
+        if image_bytes:
+            safe_title = re.sub(r'[^a-z0-9]+', '-', headline.lower())[:40]
+            featured_media_id = upload_image_to_wordpress(
+                image_bytes, filename=f"{safe_title}.jpg"
+            )
+
         payload = {
             "title": headline,
             "content": article.get("content_html", ""),
-            "status": "draft",  # Start as draft for review
+            "status": "draft",
             "categories": [category_id],
-            "author": author_ids[0] if author_ids else get_default_author_id()
+            "author": author_ids[0] if author_ids else get_default_author_id(),
         }
-        
+        if featured_media_id:
+            payload["featured_media"] = featured_media_id
+
         logger.info(f"\n→ Posting to WordPress:")
         logger.info(f"  Title: {headline}")
         logger.info(f"  Category ID: {category_id}")
         logger.info(f"  Primary Author ID: {payload['author']}")
-        
+        logger.info(f"  Featured Image ID: {featured_media_id or 'none'}")
         if len(author_ids) > 1:
             logger.info(f"  Co-author IDs: {author_ids[1:]}")
-        
-        # Post to WordPress
+
         r = requests.post(
             WP_URL,
             json=payload,
             auth=(WP_USER, WP_APP_PASSWORD),
-            timeout=60
+            timeout=60,
         )
-        
         r.raise_for_status()
         response_data = r.json()
         post_id = response_data.get("id")
-        
-        logger.info(f"✓ Successfully posted to WordPress!")
-        logger.info(f"  Post ID: {post_id}")
-        logger.info(f"  Status: {response_data.get('status')}")
-        logger.info(f"  Link: {response_data.get('link')}")
-        
-        # If there are co-authors, try to add them via post meta or custom handling
-        # This depends on your WordPress setup - you might use plugins or custom meta
-        if len(author_ids) > 1:
-            logger.info(f"  Additional authors (co-authors): {author_ids[1:]}")
-            # Note: WordPress REST API doesn't have native co-author support
-            # You may need to:
-            # 1. Use a co-authors plugin and add via custom endpoint
-            # 2. Store in post meta
-            # 3. Use a custom solution
-            # For now, we log them for manual or plugin-based handling
-        
+
+        logger.info(f"✓ Posted! Post ID: {post_id} | Link: {response_data.get('link')}")
+
+        # Store co-authors in custom post meta so functions.php can read them
+        if len(author_ids) > 1 and post_id:
+            try:
+                post_url = f"{WP_URL}/{post_id}"
+                requests.post(
+                    post_url,
+                    json={"meta": {"co_authors": author_ids[1:]}},
+                    auth=(WP_USER, WP_APP_PASSWORD),
+                    timeout=30,
+                )
+                logger.info(f"  Co-authors stored in meta: {author_ids[1:]}")
+            except Exception as meta_err:
+                logger.warning(f"  Could not save co-author meta: {meta_err}")
+
         logger.info(f"{'='*80}\n")
-        
+
         return {
             "success": True,
             "post_id": post_id,
@@ -550,7 +599,8 @@ def post_to_wordpress(article: Dict[str, Any]) -> Dict[str, Any]:
             "category_id": category_id,
             "primary_author_id": payload['author'],
             "all_author_ids": author_ids,
-            "author_count": len(author_ids)
+            "author_count": len(author_ids),
+            "featured_media_id": featured_media_id,
         }
         
     except requests.exceptions.RequestException as e:

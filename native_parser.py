@@ -1,136 +1,266 @@
 """
 NATIVE IDML NEWS EXTRACTOR
-Regex-based extraction with full formatting support and debug logging
 
-This is the current production-grade parser that uses:
-- Regular expressions for author/category detection
-- Font size heuristics for content classification
-- HTML formatting preservation from InDesign layout
+Category detection (priority order):
+  1. Filename section-code mapping (e.g. DAP→Metro, SPILL→News)
+  2. Large-font section header story in the IDML (decorative masthead)
+  3. Traditional category-marker story (single short paragraph)
+  4. Fuzzy match of extracted string against WordPress categories (done in wordpress.py)
+  5. Uncategorized fallback
+
+Images:
+  - Embedded: extracted from Spread XML CDATA base64 (large spreads like BackPage Mon)
+  - Linked: extracted from Spread XML Link elements as file:// URIs (e.g. DAP pages)
+    The JSX script should copy linked files alongside the IDML so they are available.
+
+Output: one content field (content_html) — the WordPress-ready HTML.
 """
 
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional
 import re
+import base64
+from urllib.parse import unquote
+
+
+# ---------------------------------------------------------------------------
+# Known section-code → category mappings for filenames that don't spell out
+# the section name. Keys are lowercase. Values are passed to WordPress fuzzy
+# matching, so they don't need to be exact — just close enough.
+# Add more entries here as you discover new section codes.
+# ---------------------------------------------------------------------------
+SECTION_CODE_MAP: Dict[str, str] = {
+    "dap":          "Metro",
+    "spill":        "News",
+    "healthplus":   "HealthPlus",       # column
+    "healthwise":   "HealthWise",       # opinion
+    "backpage":     "Back Page",
+    "bp":           "Back Page",
+    "mynews":       "News",
+    "lagos":        "Lagos",
+    "am business":  "Business",
+    "247 business": "247 Business",     # subcategory of Business
+    "business extra": "Business",
+    "business opening": "Business",
+    "stock page":   "Stock Market",
+    "photonews":    "Photo News",
+    "special feature": "Features",
+    "politics pulse": "Politics",
+    "capital mrk":  "Capital Market",
+    "capital market": "Capital Market",
+    "personal banking": "Personal Finance",
+    "homes":        "Homes & Property",
+    "panorama":     "Panorama",
+    "viewpoint":    "Viewpoint",
+    "editorial":    "Editorial",
+    "insurance":    "Insurance",
+}
 
 
 class IDMLNewsExtractor:
     """
-    IDML News Extractor with Rich Text Formatting Support
-    
-    This class processes InDesign Markup Language (IDML) files to extract news articles
-    with preserved formatting for WordPress integration.
-    
-    KEY FEATURES:
-    1. Extracts headlines, authors, and content from newspaper layouts
-    2. Preserves formatting (bold, italic, font sizes) as HTML
-    3. Generates WordPress-ready content with proper HTML tags
-    4. Handles multiple authors per article
-    5. Matches headlines with corresponding body content
-    
-    OUTPUT FORMATS:
-    - Plain text (backward compatible)
-    - Rich HTML (WordPress ready with <p>, <strong>, <em>, <h3>, <h4> tags)
+    IDML News Extractor with Rich Text Formatting, Image Extraction,
+    and Filename-Based Category Detection.
     """
-    
+
     def __init__(self, idml_file_path: str):
         self.idml_path = idml_file_path
         self.namespace = {'idPkg': 'http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging'}
-    
+        self.extracted_images: List[bytes] = []   # populated during extract_news_articles()
+        self.document_name: str = ''              # original .indd filename from designmap
+
+    # =========================================================================
+    # PUBLIC API
+    # =========================================================================
+
     def extract_news_articles(self) -> List[Dict[str, Any]]:
         """
-        Extract news articles with headlines, authors, and content
-        
-        PROCESS:
-        1. Parse all stories in IDML and identify marker stories
-        2. Marker stories: exactly 1 paragraph, 1 char range, 1 content element
-        3. Category formed by FIRST CONSECUTIVE sequence of markers
-        4. Multiple markers in sequence = concatenated (e.g., '247' + 'Business' = '247Business')
-        5. Apply detected category to all other stories
-        6. Filter out marker stories from final results
-        
-        EXAMPLE PATTERNS:
-        - Single marker: 'news'
-        - Multi-marker: '247' + 'Business' = '247Business'
-        - Multi-marker: 'capital' + 'market' = 'capitalmarket'
+        Extract news articles with headlines, authors, content, and images.
+
+        Returns list of article dicts. Call self.extracted_images after this
+        to get the raw image bytes found in the IDML Spread files.
         """
+        self.extracted_images = []
         all_stories = []
         detected_category = ''
         marker_story_ids = set()
-        
+
         with zipfile.ZipFile(self.idml_path, 'r') as zip_file:
-            story_files = sorted([f for f in zip_file.namelist() if f.startswith('Stories/Story_')])
-            
-            print(f"\n[DEBUG] Total story files found: {len(story_files)}")
-            
-            # FIRST PASS: Scan for ALL marker stories and their positions
-            all_markers = []  # List of (index, story_id, content)
+            # ------------------------------------------------------------------
+            # STEP 1: Parse designmap.xml for story order + document name
+            # ------------------------------------------------------------------
+            story_order, self.document_name = self._parse_designmap(zip_file)
+
+            print(f"\n[DEBUG] Document name: '{self.document_name}'")
+            print(f"[DEBUG] Story order from designmap: {len(story_order)} stories")
+
+            # ------------------------------------------------------------------
+            # STEP 2: Category — multi-strategy detection
+            # ------------------------------------------------------------------
+            filename_category = self._extract_category_from_filename(
+                self.document_name or self.idml_path
+            )
+            print(f"[DEBUG] Category from filename raw: '{filename_category}'")
+
+            # ------------------------------------------------------------------
+            # STEP 3: Build ordered list of story files
+            # ------------------------------------------------------------------
+            available = set(zip_file.namelist())
+            if story_order:
+                story_files = [
+                    f'Stories/Story_{sid}.xml'
+                    for sid in story_order
+                    if f'Stories/Story_{sid}.xml' in available
+                ]
+                # Append any stories not in designmap order (safety net)
+                all_story_files = sorted([
+                    f for f in available if f.startswith('Stories/Story_')
+                ])
+                for sf in all_story_files:
+                    if sf not in story_files:
+                        story_files.append(sf)
+            else:
+                story_files = sorted([
+                    f for f in available if f.startswith('Stories/Story_')
+                ])
+
+            print(f"[DEBUG] Total story files to process: {len(story_files)}")
+
+            # ------------------------------------------------------------------
+            # STEP 4: Scan stories for category signals (markers + section headers)
+            # ------------------------------------------------------------------
+            section_header_category = ''   # large-font decorative section header
+            all_markers = []
+
             for i, story_file in enumerate(story_files):
                 try:
                     story_content = zip_file.read(story_file)
                     root = ET.fromstring(story_content)
-                    story_id = root.find('.//Story').get('Self', '')
-                    
-                    # Check if this is a category marker story
+                    story_el = root.find('.//Story')
+                    if story_el is None:
+                        continue
+                    story_id = story_el.get('Self', '')
+
+                    # Large-font section header (e.g. "metro" at 119pt)
+                    if not section_header_category:
+                        sh = self._extract_section_header_category(root)
+                        if sh:
+                            section_header_category = sh
+                            marker_story_ids.add(story_id)
+                            print(f"[DEBUG] Section header category: '{sh}' (id={story_id})")
+
+                    # Traditional single-text marker (must have letters, not just a number)
                     if self._is_category_marker(root):
                         part = self._extract_category_from_story(root)
                         if part:
                             all_markers.append((i, story_id, part))
-                            print(f"[DEBUG] Found marker at position {i}: '{part}' (story_id: {story_id})")
-                
+
                 except Exception as e:
-                    print(f"[DEBUG] Error scanning story {i}: {e}")
-                    continue
-            
-            # Extract first CONSECUTIVE sequence of markers as category
+                    print(f"[DEBUG] Error scanning {story_file}: {e}")
+
+            # Collect first consecutive sequence of non-numeric markers
             if all_markers:
                 category_parts = []
-                expected_next_index = 0  # We want markers at positions 0, 1, 2, ...
-                
-                for marker_index, story_id, content in all_markers:
-                    if marker_index == expected_next_index:
-                        # This is a consecutive marker
+                expected = 0
+                for idx, sid, content in all_markers:
+                    if idx == expected:
                         category_parts.append(content)
-                        marker_story_ids.add(story_id)
-                        print(f"[DEBUG] Adding to category: '{content}'")
-                        expected_next_index += 1
+                        marker_story_ids.add(sid)
+                        expected += 1
                     else:
-                        # Gap found, stop collecting category markers
-                        print(f"[DEBUG] Gap detected at position {marker_index} (expected {expected_next_index}), stopping category collection")
                         break
-                
                 if category_parts:
                     detected_category = ''.join(category_parts)
-                    print(f"[DEBUG] ✓ Final category: '{detected_category}'")
-                else:
-                    print(f"[DEBUG] ✗ No consecutive markers from start found")
-            else:
-                print(f"[DEBUG] ✗ No marker stories detected in entire IDML")
-            
-            # SECOND PASS: Extract articles (excluding markers)
+                    print(f"[DEBUG] Category from markers: '{detected_category}'")
+
+            # Priority: mapped filename > section header > raw filename > marker
+            final_category = (
+                self._map_section_code(filename_category)
+                or section_header_category
+                or filename_category
+                or detected_category
+            )
+            print(f"[DEBUG] Final category: '{final_category}'")
+
+            # ------------------------------------------------------------------
+            # STEP 5: Extract images from Spread XML files
+            # ------------------------------------------------------------------
+            self.extracted_images = self._extract_images_from_spreads(zip_file)
+            print(f"[DEBUG] Images extracted (non-cartoon): {len(self.extracted_images)}")
+
+            # ------------------------------------------------------------------
+            # STEP 6: Parse all article stories
+            # ------------------------------------------------------------------
             for story_file in story_files:
                 try:
                     story_content = zip_file.read(story_file)
                     article_data = self._parse_news_story(story_content, story_file)
-                    
+
                     if article_data and article_data.get('raw_content'):
-                        # Skip category marker stories
                         if article_data.get('story_id') not in marker_story_ids:
-                            # Apply detected category to article
-                            if detected_category and not article_data.get('category'):
-                                article_data['category'] = detected_category
+                            if not article_data.get('category'):
+                                article_data['category'] = final_category
                             all_stories.append(article_data)
                         else:
-                            print(f"[DEBUG] Filtering out category marker: {article_data['story_id']}")
+                            print(f"[DEBUG] Filtered marker story: {article_data['story_id']}")
                 except Exception as e:
-                    print(f"Error parsing {story_file}: {e}")
-                    continue
-        
-        print(f"[DEBUG] Processing complete. Articles: {len(all_stories)}, Category: '{detected_category}'\n")
-        
-        # Match headlines with body content and create complete articles
-        return self._match_headlines_with_content(all_stories)
-    
+                    print(f"[DEBUG] Error parsing {story_file}: {e}")
+
+            # ------------------------------------------------------------------
+            # STEP 7: Detect photo-caption author attribution stories
+            # (e.g. 247-Business "OLUWAKEMI ABIMBOLA reports" in caption style)
+            # ------------------------------------------------------------------
+            author_attributions = self._detect_author_attributions(zip_file, story_files)
+
+        print(f"[DEBUG] Processing done. Stories: {len(all_stories)}, Category: '{final_category}'\n")
+
+        articles = self._match_headlines_with_content(all_stories, author_attributions)
+
+        # ------------------------------------------------------------------
+        # Per-article image assignment
+        # Priority: author-name match in linked image filename → first non-cartoon embedded
+        # Cartoon images (CARTOON in path) are never used as featured images.
+        # ------------------------------------------------------------------
+        image_records = getattr(self, 'image_records', [])
+        used_image_indices: set = set()
+
+        for article in articles:
+            if not article.get('content_html'):
+                continue
+            author = article.get('author', '')
+            if author:
+                # Look for a non-cartoon image whose filename contains part of the author name
+                author_words = [w.lower() for w in author.split() if len(w) > 2]
+                for idx, rec in enumerate(image_records):
+                    if idx in used_image_indices or rec.get('is_cartoon') or not rec.get('bytes'):
+                        continue
+                    fname_lower = rec['filename'].lower()
+                    fname_no_ext = re.sub(r'\.[a-z]{2,5}$', '', fname_lower)
+                    if any(w in fname_no_ext for w in author_words):
+                        article['featured_image_bytes'] = rec['bytes']
+                        used_image_indices.add(idx)
+                        print(f"[DEBUG] Image matched: '{rec['filename']}' -> author '{author}'")
+                        break
+
+        # Fallback: assign first unused non-cartoon embedded image to the lead article
+        if self.extracted_images:
+            lead_candidates = [
+                a for a in articles
+                if a.get('content_html') and not a.get('featured_image_bytes')
+            ]
+            if lead_candidates:
+                lead = max(lead_candidates, key=lambda a: len(a.get('content_html', '')))
+                # Find first unused non-cartoon record
+                for idx, rec in enumerate(image_records):
+                    if idx not in used_image_indices and not rec.get('is_cartoon') and rec.get('bytes'):
+                        lead['featured_image_bytes'] = rec['bytes']
+                        used_image_indices.add(idx)
+                        print(f"[DEBUG] Fallback image -> lead article '{lead.get('headline', '')[:40]}'")
+                        break
+
+        return articles
+
     def extract_from_xml_file(self, xml_file_path: str) -> Optional[Dict[str, Any]]:
         """Extract from a single XML story file (for batch processing)"""
         try:
@@ -140,804 +270,986 @@ class IDMLNewsExtractor:
         except Exception as e:
             print(f"Error parsing {xml_file_path}: {e}")
             return None
-    
+
+    # =========================================================================
+    # DESIGNMAP + CATEGORY + IMAGE EXTRACTION
+    # =========================================================================
+
+    def _parse_designmap(self, zip_file: zipfile.ZipFile):
+        """
+        Parse designmap.xml to get:
+        - Ordered list of story IDs (from StoryList attribute)
+        - Document name (original .indd filename)
+        """
+        story_order = []
+        document_name = ''
+        try:
+            dm_content = zip_file.read('designmap.xml')
+            root = ET.fromstring(dm_content)
+            story_list_str = root.get('StoryList', '')
+            if story_list_str:
+                story_order = story_list_str.split()
+            document_name = root.get('Name', '')
+        except Exception as e:
+            print(f"[DEBUG] Could not parse designmap.xml: {e}")
+        return story_order, document_name
+
+    def _extract_category_from_filename(self, name: str) -> str:
+        """
+        Extract section/category from the InDesign document filename.
+
+        Examples:
+          'Capital Mrk 26.indd'      → 'Capital Mrk'
+          'News - 8 - Copy.indd'     → 'News'
+          '247 Business -12.indd'    → '247 Business'
+          'BackPage Mon.indd'        → 'BackPage Mon'
+          'DAP4,5.indd'              → 'DAP'
+          'Special feature 42&43'    → 'Special feature'
+        """
+        import os
+        # Use just the basename (handle full paths)
+        name = os.path.basename(name)
+
+        # Remove .indd extension
+        name = re.sub(r'\.indd$', '', name, flags=re.IGNORECASE)
+        # Remove .idml extension (if given an IDML path directly)
+        name = re.sub(r'\.idml$', '', name, flags=re.IGNORECASE)
+        # Remove " - Copy" or " copy" suffix
+        name = re.sub(r'\s*-\s*Copy\s*$', '', name, flags=re.IGNORECASE)
+
+        # Remove trailing page numbers with separator (e.g. " 26", " -12", " 42&43")
+        name = re.sub(r'[\s\-,]+\d[\d,&\s]*$', '', name)
+        # Remove digits directly attached without separator (e.g. "DAP4,5" → "DAP")
+        name = re.sub(r'\d[\d,&]*$', '', name)
+
+        name = name.strip(' -,')
+        return name
+
+    def _extract_images_from_spreads(self, zip_file: zipfile.ZipFile) -> List[bytes]:
+        """
+        Extract images from Spread XML files.
+
+        Correlates each Link URI with its embedded CDATA block (they live inside the
+        same <Image> element in InDesign).  Cartoon images (CARTOON in path) are
+        recorded but EXCLUDED from the returned bytes list so they are never used as
+        featured images.
+
+        Populates:
+          self.linked_image_uris  – all linked file paths (for reporting)
+          self.image_records      – structured list of
+                                    {bytes, uri, filename, is_cartoon}
+
+        Returns list of non-cartoon image bytes (embedded or loaded from disk).
+        """
+        import os
+        images: List[bytes] = []
+        self.linked_image_uris: List[str] = []
+        self.image_records: List[Dict] = []
+        spread_files = [f for f in zip_file.namelist() if f.startswith('Spreads/')]
+
+        for spread_file in spread_files:
+            try:
+                raw = zip_file.read(spread_file)
+                if len(raw) > 200 * 1024 * 1024:
+                    print(f"[DEBUG] Skipping oversized spread: {spread_file} ({len(raw)//1024//1024}MB)")
+                    continue
+                spread_text = raw.decode('utf-8', errors='ignore')
+
+                # Collect positions of all Link URIs in this spread
+                link_positions = [
+                    (m.start(), m.group(1))
+                    for m in re.finditer(r'LinkResourceURI="([^"]+)"', spread_text)
+                ]
+
+                # Collect positions of all valid (non-XMP) CDATA image blocks
+                cdata_positions = []
+                for m in re.finditer(
+                    r'<Contents><!\[CDATA\[(.*?)\]\]></Contents>', spread_text, re.DOTALL
+                ):
+                    clean_b64 = ''.join(m.group(1).split())
+                    if clean_b64 and not clean_b64.startswith('<?xpacket') and len(clean_b64) > 100:
+                        cdata_positions.append((m.start(), clean_b64))
+
+                for i, (link_pos, raw_uri) in enumerate(link_positions):
+                    # Normalise URI → UNC/local path
+                    decoded = unquote(raw_uri.replace('file://', '').replace('file:', ''))
+                    if decoded.startswith('//'):
+                        unc = decoded.replace('/', '\\')
+                    elif len(decoded) > 2 and decoded[1] == ':':
+                        unc = decoded.replace('/', '\\')
+                    elif len(decoded) > 3 and decoded[2] == ':':
+                        unc = decoded[1:].replace('/', '\\')
+                    else:
+                        unc = decoded.replace('/', '\\')
+
+                    filename = unc.replace('\\', '/').split('/')[-1]
+                    is_cartoon = 'CARTOON' in unc.upper()
+                    self.linked_image_uris.append(unc)
+
+                    # Find the CDATA block that comes AFTER this Link and BEFORE the next Link
+                    next_link_pos = link_positions[i + 1][0] if i + 1 < len(link_positions) else len(spread_text)
+                    cdata_in_range = [
+                        (pos, b64) for pos, b64 in cdata_positions
+                        if link_pos < pos < next_link_pos
+                    ]
+
+                    img_bytes: Optional[bytes] = None
+                    if cdata_in_range:
+                        try:
+                            img_bytes = base64.b64decode(cdata_in_range[0][1])
+                            if len(img_bytes) < 5 * 1024:
+                                img_bytes = None
+                        except Exception:
+                            img_bytes = None
+
+                    # Fallback: try to read from disk (works when file server is reachable)
+                    if img_bytes is None:
+                        try:
+                            if os.path.exists(unc):
+                                with open(unc, 'rb') as img_f:
+                                    img_bytes = img_f.read()
+                                if len(img_bytes) < 5 * 1024:
+                                    img_bytes = None
+                        except Exception:
+                            pass
+
+                    record: Dict[str, Any] = {
+                        'bytes':      img_bytes,
+                        'uri':        unc,
+                        'filename':   filename,
+                        'is_cartoon': is_cartoon,
+                    }
+                    self.image_records.append(record)
+
+                    tag = 'CARTOON' if is_cartoon else 'columnist'
+                    size_kb = len(img_bytes) // 1024 if img_bytes else 0
+                    print(f"[DEBUG] Image [{tag}] {filename} ({size_kb}KB embedded)")
+
+                    if img_bytes and not is_cartoon:
+                        images.append(img_bytes)
+                        if len(images) >= 10:
+                            return images
+
+            except Exception as e:
+                print(f"[DEBUG] Error reading spread {spread_file}: {e}")
+
+        return images
+
+    # =========================================================================
+    # STORY PARSING
+    # =========================================================================
+
     def _parse_news_story(self, xml_content: bytes, filename: str) -> Optional[Dict[str, Any]]:
         """Parse individual story XML and extract structured content"""
         try:
             root = ET.fromstring(xml_content)
-            
-            # Extract category first (if present as simple content)
+            story_el = root.find('.//Story')
+            if story_el is None:
+                return None
+
+            para_ranges = root.findall(".//ParagraphStyleRange")
+            if not para_ranges:
+                return None
+
+            # Skip Date Line stories (e.g. "MONDAY, JUNE 16, 2025")
+            for pr in para_ranges:
+                style = pr.get('AppliedParagraphStyle', '')
+                if 'Date Line' in style or 'DateLine' in style:
+                    return None
+
+            # Extract category from story (marker detection)
             category = self._extract_category_from_story(root)
-            
-            # Extract all content elements with their formatting and structure
+
             content_data = []
             paragraphs = []
-            
-            # Parse by paragraph to maintain structure
-            # KEY FIX: Track which ParagraphStyleRange each element belongs to
-            para_ranges = root.findall(".//ParagraphStyleRange")
-            
             para_range_index = 0
+
             for para_range in para_ranges:
                 para_range_index += 1
                 para_content = []
-                
-                # Get all content within this paragraph, including line breaks  
+                para_style = para_range.get('AppliedParagraphStyle', '')
+                para_justification = para_range.get('Justification', '')
+
                 char_ranges = para_range.findall(".//CharacterStyleRange")
-                
                 for char_range in char_ranges:
-                    # Handle both Content elements and Br (line break) elements
                     for child in char_range:
                         if child.tag == 'Content' and child.text:
                             text_content = child.text.strip()
-                            if text_content:
-                                # Get formatting information
-                                font_size_str = char_range.get('PointSize', '12')
-                                try:
-                                    font_size = float(font_size_str)
-                                except (ValueError, TypeError):
-                                    font_size = 12.0
-                                    
-                                font_style = char_range.get('FontStyle', 'Regular')
-                                is_bold = 'Bold' in font_style
-                                is_italic = 'Italic' in font_style
-                                
-                                # FIX: Store the paragraph range index to properly separate paragraphs
-                                content_item = {
-                                    'text': text_content,
-                                    'font_size': font_size,
-                                    'font_style': font_style,
-                                    'is_bold': is_bold,
-                                    'is_italic': is_italic,
-                                    'applied_style': char_range.get('AppliedCharacterStyle', ''),
-                                    'paragraph_style': para_range.get('AppliedParagraphStyle', ''),
-                                    'paragraph_range_index': para_range_index  # Track which ParagraphStyleRange this came from
-                                }
-                                content_data.append(content_item)
-                                para_content.append(text_content)
-                        
+                            if not text_content:
+                                continue
+
+                            font_size_str = char_range.get('PointSize', '12')
+                            try:
+                                font_size = float(font_size_str)
+                            except (ValueError, TypeError):
+                                font_size = 12.0
+
+                            font_style = char_range.get('FontStyle', 'Regular')
+                            is_bold = 'Bold' in font_style
+                            is_italic = 'Italic' in font_style
+
+                            content_item = {
+                                'text': text_content,
+                                'font_size': font_size,
+                                'font_style': font_style,
+                                'is_bold': is_bold,
+                                'is_italic': is_italic,
+                                'applied_style': char_range.get('AppliedCharacterStyle', ''),
+                                'paragraph_style': para_style,
+                                'paragraph_justification': para_justification,
+                                'paragraph_range_index': para_range_index,
+                            }
+                            content_data.append(content_item)
+                            para_content.append(text_content)
+
                         elif child.tag == 'Br':
-                            # Handle line breaks within paragraphs
-                            if para_content:  # Only add if we have content
+                            if para_content:
                                 paragraphs.append(' '.join(para_content))
                                 para_content = []
-                
-                # Add any remaining content in this paragraph
+
                 if para_content:
                     paragraphs.append(' '.join(para_content))
-            
+
             if not content_data:
                 return None
-                
+
             raw_content = ' '.join(paragraphs)
-            full_text = '\n'.join(paragraphs)  # Preserve paragraph structure
-                
+            full_text = '\n'.join(paragraphs)
+
             return {
-                'story_id': root.find('.//Story').get('Self', ''),
+                'story_id': story_el.get('Self', ''),
                 'filename': filename,
                 'content_elements': content_data,
                 'raw_content': raw_content,
                 'full_text': full_text,
                 'paragraphs': paragraphs,
-                'category': category
+                'category': category,
             }
-            
+
         except ET.ParseError as e:
-            print(f"XML Parse error in {filename}: {e}")
+            print(f"[DEBUG] XML parse error in {filename}: {e}")
             return None
-    
-    def _extract_category_from_story(self, root: ET.Element) -> str:
-        """
-        Extract category from story XML
-        
-        CATEGORY MARKER DETECTION (IMPROVED):
-        A category marker story has:
-        1. EXACTLY 1 ParagraphStyleRange element
-        2. That paragraph contains EXACTLY 1 CharacterStyleRange
-        3. That range contains EXACTLY 1 Content element (no other content)
-        4. The content value is the category name (e.g., 'news', 'metro', 'business')
-        
-        Examples:
-        - Story_u184ec.xml: <Content>news</Content> (News IDML marker)
-        - Story_uf768.xml: <Content>metro</Content> (DAP IDML marker)
-        
-        This approach is much more reliable than pattern matching.
-        """
-        # STEP 1: Check if this is a category marker story
-        para_ranges = root.findall(".//ParagraphStyleRange")
-        
-        # Marker stories have exactly 1 paragraph
-        if len(para_ranges) == 1:
-            para_range = para_ranges[0]
-            char_ranges = para_range.findall(".//CharacterStyleRange")
-            
-            # Marker stories have exactly 1 character range per paragraph
-            if len(char_ranges) == 1:
-                char_range = char_ranges[0]
-                contents = char_range.findall("Content")
-                
-                # Marker stories have exactly 1 content element
-                if len(contents) == 1:
-                    content = contents[0]
-                    
-                    if content.text:
-                        category_text = content.text.strip()
-                        
-                        # Validate: short, no special chars, looks like category
-                        if (len(category_text) > 0 and 
-                            len(category_text) <= 30 and  # Reasonable length for category
-                            not category_text.startswith('\n') and  # Not empty/whitespace
-                            self._is_valid_category(category_text)):
-                            
-                            print(f"[DEBUG] Detected CATEGORY MARKER: '{category_text}'")
-                            return category_text
-        
-        return ''
-    
+
+    # =========================================================================
+    # CATEGORY MARKER DETECTION
+    # =========================================================================
+
     def _is_category_marker(self, root: ET.Element) -> bool:
         """
-        Check if a story XML is a category marker story
-        
-        Category marker stories have:
-        1. EXACTLY 1 ParagraphStyleRange element (not 2+)
-        2. EXACTLY 1 CharacterStyleRange per paragraph
-        3. EXACTLY 1 Content element (no other content)
-        4. Very short content (< 30 chars)
-        
-        This is much more reliable than regex/pattern matching on content.
+        Check if a story is a category marker (single short paragraph with letters).
+        Rejects page numbers (pure digits like '5', '37') and Date Line stories.
         """
         para_ranges = root.findall(".//ParagraphStyleRange")
-        
-        # Must have exactly 1 paragraph
         if len(para_ranges) != 1:
             return False
-        
-        para_range = para_ranges[0]
-        char_ranges = para_range.findall(".//CharacterStyleRange")
-        
-        # Must have exactly 1 character range
+
+        # Reject Date Line paragraph style
+        style = para_ranges[0].get('AppliedParagraphStyle', '')
+        if 'Date Line' in style or 'DateLine' in style:
+            return False
+
+        char_ranges = para_ranges[0].findall(".//CharacterStyleRange")
         if len(char_ranges) != 1:
             return False
-        
-        char_range = char_ranges[0]
-        contents = char_range.findall("Content")
-        
-        # Must have exactly 1 content element
-        if len(contents) != 1:
+        contents = char_ranges[0].findall("Content")
+        if len(contents) != 1 or not contents[0].text:
             return False
-        
-        # Content must be short and valid
-        content = contents[0]
-        if content.text:
-            text = content.text.strip()
-            if len(text) > 0 and len(text) <= 30:
-                return True
-        
-        return False
-    
-    def _is_valid_category(self, text: str) -> bool:
+
+        text = contents[0].text.strip()
+        if not text or len(text) > 30:
+            return False
+
+        # Must contain at least one letter — rejects page numbers like "5", "37"
+        return any(c.isalpha() for c in text)
+
+    def _extract_category_from_story(self, root: ET.Element) -> str:
+        """Extract category text from a marker story"""
+        para_ranges = root.findall(".//ParagraphStyleRange")
+        if len(para_ranges) == 1:
+            char_ranges = para_ranges[0].findall(".//CharacterStyleRange")
+            if len(char_ranges) == 1:
+                contents = char_ranges[0].findall("Content")
+                if len(contents) == 1 and contents[0].text:
+                    text = contents[0].text.strip()
+                    if text and len(text) <= 30 and self._is_valid_category(text):
+                        return text
+        return ''
+
+    def _map_section_code(self, raw: str) -> str:
         """
-        Check if text is a valid category name
-        
-        Valid categories:
-        - Single word: 'metro', 'news', 'sports'
-        - Multi-word with spaces: 'front page', 'inside story'
-        - May contain hyphens: 'metro-news'
-        - Must contain at least one letter (rejects pure numbers like '5', '37')
+        Map a raw filename section string to a readable category name.
+        Uses SECTION_CODE_MAP for known codes; returns '' if no match.
         """
-        # Remove extra whitespace
+        if not raw:
+            return ''
+        key = raw.lower().strip()
+        # Direct lookup
+        if key in SECTION_CODE_MAP:
+            return SECTION_CODE_MAP[key]
+        # Prefix lookup (e.g. "lagos mon" starts with "lagos")
+        for code, name in SECTION_CODE_MAP.items():
+            if key.startswith(code) or code.startswith(key):
+                return name
+        return ''
+
+    def _extract_section_header_category(self, root: ET.Element) -> str:
+        """
+        Detect large-font decorative section headers like the 119pt 'metro' story.
+        These are single-paragraph stories with very large font size and short text.
+        Must have at least 3 letters and NOT be a page number or date.
+        """
+        para_ranges = root.findall(".//ParagraphStyleRange")
+        if len(para_ranges) != 1:
+            return ''
+
+        char_ranges = para_ranges[0].findall(".//CharacterStyleRange")
+        if len(char_ranges) != 1:
+            return ''
+
+        contents = char_ranges[0].findall("Content")
+        if len(contents) != 1 or not contents[0].text:
+            return ''
+
+        text = contents[0].text.strip()
+        if not text or len(text) > 30:
+            return ''
+
+        # Must have at least 3 letters (rejects page numbers like "5", "4")
+        letters = [c for c in text if c.isalpha()]
+        if len(letters) < 3:
+            return ''
+
+        # Section headers are simple category names — reject headlines that contain
+        # question marks, exclamation marks, digits in parens, or en-dashes
+        if re.search(r'[?!–—]|\(\d+\)', text):
+            return ''
+
+        # Must have large font size (section header visual style)
+        size_str = char_ranges[0].get('PointSize', '0')
+        try:
+            size = float(size_str)
+        except (ValueError, TypeError):
+            return ''
+
+        if size >= 30:
+            return text.strip()
+
+        return ''
+
+    def _looks_like_person_name(self, text: str) -> bool:
+        """
+        Return True if text looks like a journalist/columnist name
+        (2–4 Title-Case words, no punctuation, no common English words).
+        Used to detect BackPage-style standalone columnist name stories.
+        """
         text = text.strip()
-        
+        if re.search(r'[?!:;/\\",\(\)\[\]]', text):
+            return False
+        words = text.split()
+        if len(words) < 2 or len(words) > 4:
+            return False
+        # Common headline / non-name words (lowercase comparison)
+        not_name = {
+            'the', 'a', 'an', 'and', 'but', 'for', 'or', 'nor', 'so', 'yet',
+            'in', 'on', 'at', 'to', 'by', 'of', 'as', 'up', 'off', 'out',
+            'with', 'from', 'into', 'over', 'under', 'amid', 'upon', 'amid',
+            'are', 'is', 'was', 'were', 'be', 'been', 'has', 'have', 'had',
+            'will', 'would', 'could', 'should', 'can', 'may', 'must',
+            'says', 'said', 'gets', 'hits', 'sets', 'runs', 'backs',
+            'faces', 'urges', 'seeks', 'warns', 'vows', 'wins', 'loses',
+            'new', 'old', 'big', 'key', 'top', 'its', 'his', 'her',
+            'this', 'that', 'these', 'those', 'our', 'their',
+        }
+        for word in words:
+            if not word[0].isupper():
+                return False
+            if len(word) < 2:
+                return False
+            if word.lower().rstrip('.,') in not_name:
+                return False
+        return True
+
+    def _name_hint_from_uri(self, uri: str) -> str:
+        """
+        Extract a journalist name hint from a linked image filename.
+        e.g. 'KUNLE SOMORIN.tif'  → 'Kunle Somorin'
+             'Lekan Sote copy.tif' → 'Lekan Sote'
+             'Tella.tif'           → 'Tella'
+        Returns '' for cartoon images or paths with no useful name.
+        """
+        if 'CARTOON' in uri.upper():
+            return ''
+        filename = uri.replace('\\', '/').split('/')[-1]
+        name = re.sub(r'\.[a-zA-Z]{2,5}$', '', filename)      # strip extension
+        name = re.sub(r'\s*copy\s*$', '', name, flags=re.IGNORECASE).strip()
+        return name.title() if name else ''
+
+    def _detect_author_attributions(
+        self, zip_file: zipfile.ZipFile, story_files: List[str]
+    ) -> Dict[str, str]:
+        """
+        Scan stories for Photo-caption-style stories that contain an ALL-CAPS Bold
+        name followed by 'reports' or 'writes'.  Pattern found in 247-Business-style
+        pages:
+            [regular text]  [BOLD ALL-CAPS "OLUWAKEMI ABIMBOLA"]  [regular "reports"]
+
+        Returns {story_id: author_name (title-cased)}.
+        """
+        attributions: Dict[str, str] = {}
+        for story_file in story_files:
+            try:
+                content = zip_file.read(story_file)
+                root = ET.fromstring(content)
+                story_el = root.find('.//Story')
+                if story_el is None:
+                    continue
+                story_id = story_el.get('Self', '')
+
+                for pr in root.findall('.//ParagraphStyleRange'):
+                    style = pr.get('AppliedParagraphStyle', '').lower()
+                    if 'caption' not in style and 'photo' not in style:
+                        continue
+                    char_ranges = pr.findall('.//CharacterStyleRange')
+                    for i, cr in enumerate(char_ranges):
+                        if 'bold' not in cr.get('FontStyle', '').lower():
+                            continue
+                        for c in cr.findall('Content'):
+                            if not c.text:
+                                continue
+                            name_text = c.text.strip()
+                            if not name_text.isupper() or len(name_text.split()) < 2:
+                                continue
+                            # Confirm next char-range contains 'reports' / 'writes'
+                            confirmed = False
+                            if i + 1 < len(char_ranges):
+                                for nc in char_ranges[i + 1].findall('Content'):
+                                    if nc.text and nc.text.strip().lower() in (
+                                        'reports', 'writes', 'reports.', 'writes.'
+                                    ):
+                                        confirmed = True
+                            if confirmed or len(name_text.split()) <= 4:
+                                attributions[story_id] = name_text.title()
+                                print(f"[DEBUG] Photo-caption author: '{name_text.title()}' (story {story_id})")
+
+            except Exception:
+                pass
+        return attributions
+
+    def _is_valid_category(self, text: str) -> bool:
+        """Validate category text"""
+        text = text.strip()
         if not text:
             return False
-        
-        # CRITICAL: Must contain at least one letter
-        # This rejects page numbers (5, 37) and numeric IDs
         if not any(c.isalpha() for c in text):
-            print(f"[DEBUG] Rejected category '{text}' - no letters found (likely a number/ID)")
             return False
-        
-        # Allow letters, numbers, spaces, hyphens, underscores
-        # This covers: metro, news, front page, metro-news, etc.
-        allowed_pattern = r'^[a-zA-Z0-9\s\-_&,\.]+$'
-        
-        if not re.match(allowed_pattern, text):
+        if not re.match(r'^[a-zA-Z0-9\s\-_&,\.]+$', text):
             return False
-        
-        # Minimum 1 character, maximum 30 (reasonable for category names)
         if len(text) < 1 or len(text) > 30:
             return False
-        
-        # Avoid common false positives (email, URLs, etc.)
         if '@' in text or 'http' in text.lower():
             return False
-        
         return True
-    
-    def _match_headlines_with_content(self, all_stories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Match headlines with their corresponding body content"""
+
+    # =========================================================================
+    # HEADLINE / BODY MATCHING
+    # =========================================================================
+
+    def _match_headlines_with_content(
+        self,
+        all_stories: List[Dict[str, Any]],
+        author_attributions: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Match headlines with their corresponding body content."""
         headlines = []
         body_stories = []
-        
-        # Separate headlines from body content
+        person_name_stories = []   # BackPage-style columnist name stories
+
         for story in all_stories:
             if self._is_metadata_content(story['raw_content']):
                 continue
-                
             content_type = self._determine_story_type(story)
-            
             if content_type == 'headline':
                 headlines.append(story)
             elif content_type == 'body_content':
                 body_stories.append(story)
-        
-        # Match headlines with body content
+            elif content_type == 'person_name':
+                person_name_stories.append(story)
+                print(f"[DEBUG] Person-name story: '{story['raw_content']}' (id={story['story_id']})")
+
         matched_articles = []
         used_headlines = set()
-        
+
         for body_story in body_stories:
-            # Extract author and content from body - BOTH PLAIN AND RICH VERSIONS
             author = self._extract_author_from_body(body_story)
-            
-            # Generate plain text content (existing functionality)
-            content_plain = self._clean_content_text(body_story)
-            
-            # Generate rich HTML content for WordPress (NEW!)
             content_html = self._generate_rich_content_html(body_story)
-            
-            # Try to find matching headline
             matching_headline = self._find_matching_headline(body_story, headlines, used_headlines)
-            
+
             if matching_headline:
                 headline_text = matching_headline['raw_content']
                 used_headlines.add(matching_headline['story_id'])
             else:
-                # Try to extract headline from first sentence if it's formatted differently
                 headline_text = self._extract_headline_from_content(body_story)
-            
+
             article = {
                 'story_id': body_story['story_id'],
-                'headline_story_id': matching_headline['story_id'] if matching_headline else '',
-                'filename': body_story['filename'],
-                'headline_filename': matching_headline['filename'] if matching_headline else '',
                 'article_type': 'news_article',
                 'headline': headline_text,
                 'author': author,
-                'category': body_story.get('category', ''),  # Add category from extraction
-                
-                # DUAL CONTENT FORMAT - Choose what you need for WordPress!
-                'content': content_plain,           # Plain text version (backward compatibility)
-                'content_html': content_html,       # Rich HTML version for WordPress
-                'content_formatted': True,          # Flag indicating HTML is available
-                
-                'full_text': body_story.get('full_text', ''),
-                'paragraphs': body_story.get('paragraphs', []),
+                'category': body_story.get('category', ''),
+                'content_html': content_html,
+                'featured_image_bytes': None,
                 'metadata': {
-                    'body_elements': len(body_story['content_elements']),
-                    'headline_elements': len(matching_headline['content_elements']) if matching_headline else 0,
                     'has_matching_headline': bool(matching_headline),
-                    'formatting_preserved': bool(content_html),
-                    'html_paragraph_count': len(re.findall(r'<p>', content_html)) if content_html else 0
-                }
+                    'html_paragraph_count': len(re.findall(r'<p>', content_html)) if content_html else 0,
+                },
             }
-            
             matched_articles.append(article)
-        
-        # Add standalone headlines that weren't matched
+
+        # Standalone headlines with no matched body
         for headline in headlines:
             if headline['story_id'] not in used_headlines:
-                article = {
+                matched_articles.append({
                     'story_id': headline['story_id'],
-                    'headline_story_id': headline['story_id'],
-                    'filename': headline['filename'],
-                    'headline_filename': headline['filename'],
                     'article_type': 'standalone_headline',
                     'headline': headline['raw_content'],
                     'author': '',
-                    'category': headline.get('category', ''),  # Add category for headlines too
-                    'content': '',
-                    'full_text': headline['raw_content'],
-                    'paragraphs': [headline['raw_content']],
+                    'category': headline.get('category', ''),
+                    'content_html': '',
+                    'featured_image_bytes': None,
                     'metadata': {
-                        'body_elements': 0,
-                        'headline_elements': len(headline['content_elements']),
-                        'has_matching_headline': True
-                    }
-                }
-                matched_articles.append(article)
-        
+                        'has_matching_headline': True,
+                        'html_paragraph_count': 0,
+                    },
+                })
+
+        # ------------------------------------------------------------------
+        # SECOND PASS: assign BackPage-style person-name stories as authors
+        # Only consider body stories with substantial content (≥2 <p> tags)
+        # to avoid assigning columnist names to pullquotes or short sidebars.
+        # ------------------------------------------------------------------
+        used_person_names: set = set()
+        if person_name_stories:
+            for article in matched_articles:
+                if article.get('author'):
+                    continue
+                # Skip short/empty articles (pullquotes, disclaimers, sidebars)
+                para_count = article.get('metadata', {}).get('html_paragraph_count', 0)
+                if para_count < 2:
+                    continue
+                available = [
+                    s for s in person_name_stories
+                    if s['story_id'] not in used_person_names
+                ]
+                if not available:
+                    break
+                nearest = min(
+                    available,
+                    key=lambda s: self._calculate_id_distance(article['story_id'], s['story_id']),
+                )
+                dist = self._calculate_id_distance(article['story_id'], nearest['story_id'])
+                if dist < 2000:     # only assign if reasonably close in story order
+                    # Normalise non-breaking spaces in the name
+                    name = nearest['raw_content'].replace('\xa0', ' ').strip()
+                    article['author'] = name
+                    used_person_names.add(nearest['story_id'])
+                    print(f"[DEBUG] Assigned columnist author '{name}' -> story {article['story_id']}")
+
+        # ------------------------------------------------------------------
+        # THIRD PASS: author from photo-caption attribution stories
+        # (e.g. 247-Business where "OLUWAKEMI ABIMBOLA reports" is a
+        #  separate Photo caption story next to the body story)
+        # ------------------------------------------------------------------
+        if author_attributions:
+            for article in matched_articles:
+                if article.get('author'):
+                    continue
+                nearest_attr = min(
+                    author_attributions.items(),
+                    key=lambda x: self._calculate_id_distance(article['story_id'], x[0]),
+                    default=(None, None),
+                )
+                if nearest_attr[1]:
+                    dist = self._calculate_id_distance(article['story_id'], nearest_attr[0])
+                    if dist < 2000:
+                        article['author'] = nearest_attr[1]
+                        print(f"[DEBUG] Assigned caption author '{nearest_attr[1]}' -> story{article['story_id']}")
+
         return matched_articles
-    
+
     def _determine_story_type(self, story: Dict[str, Any]) -> str:
-        """Determine if this story is a headline or body content"""
+        """Determine if a story is a headline or body content"""
         content_elements = story['content_elements']
         raw_content = story['raw_content']
-        
+
         if not content_elements:
             return 'unknown'
-        
-        avg_font_size = sum(elem['font_size'] for elem in content_elements) / len(content_elements)
-        has_bold = any(elem['is_bold'] for elem in content_elements)
+
+        avg_font_size = sum(e['font_size'] for e in content_elements) / len(content_elements)
+        has_bold = any(e['is_bold'] for e in content_elements)
         text_length = len(raw_content)
         paragraph_count = len(story.get('paragraphs', []))
-        
-        # Headlines are typically: large font, bold, short, single paragraph
-        if (avg_font_size >= 15 and has_bold and text_length < 100 and paragraph_count <= 1):
+
+        # Headlines: large font, bold, short, single paragraph
+        if avg_font_size >= 15 and has_bold and text_length < 150 and paragraph_count <= 2:
+            # BackPage columns: columnist name is a separate Bold story at ~14-24pt
+            # (actual article headlines on BackPage are typically 29pt+)
+            if avg_font_size < 25 and self._looks_like_person_name(raw_content):
+                return 'person_name'
             return 'headline'
-        
-        # Body content: smaller font, multiple paragraphs, longer text
-        elif (avg_font_size < 15 and text_length > 50 and paragraph_count > 1):
+
+        # Body content: smaller font, multiple paragraphs, substantial text
+        if avg_font_size < 15 and text_length > 50 and paragraph_count > 1:
             return 'body_content'
-        
-        # Author line detection: starts with name pattern
-        elif self._looks_like_author_line(raw_content):
+
+        if self._looks_like_author_line(raw_content):
             return 'body_content'
-        
+
         return 'unknown'
-    
+
+    # =========================================================================
+    # AUTHOR EXTRACTION
+    # =========================================================================
+
     def _extract_author_from_body(self, body_story: Dict[str, Any]) -> str:
-        """Extract author from body content"""
+        """
+        Extract author from first paragraph of body story.
+
+        Confirmed pattern from IDML inspection:
+        - First ParagraphStyleRange uses Justification="CenterAlign"
+        - CharacterStyleRange has FontStyle="Bold"
+        - Content is "Name, City" e.g. "Deborah Musa, Abuja"
+        """
+        content_elements = body_story.get('content_elements', [])
         paragraphs = body_story.get('paragraphs', [])
+
         if not paragraphs:
             return ''
-        
+
         first_paragraph = paragraphs[0].strip()
-        
-        # Enhanced author patterns for Nigerian newspapers
-        author_patterns = [
-            # Standard "Name, City" format
-            r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*),\s+[A-Z][a-z]+',
-            # Multiple authors with "and" - more flexible
-            r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*)\s*$',
-            # Single author names at start of paragraph
-            r'^([A-Z][a-z]+-[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+-[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*)',  # Hyphenated names
-            # "By Author" format
-            r'^By\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
-            # Author names that end with location
-            r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*)\s*,\s*[A-Za-z]+',
+
+        # Check if first element has center-align + bold (strong byline signal)
+        first_elements = [
+            e for e in content_elements if e.get('paragraph_range_index', 0) == 1
         ]
-        
+        first_is_centered_bold = any(
+            e.get('is_bold') and 'Center' in e.get('paragraph_justification', '')
+            for e in first_elements
+        )
+
+        if first_is_centered_bold:
+            # High confidence: extract the byline directly
+            byline = first_paragraph.strip().replace('\xa0', ' ')
+            # Strip location: "Name, City" → "Name"
+            name_part = re.sub(r',.*$', '', byline).strip()
+            if name_part and len(name_part) < 80:
+                return name_part
+
+        # Fallback: regex patterns for Nigerian newspaper bylines
+        author_patterns = [
+            # "Name, City" or "Name and Name, City"
+            r'^([A-Z][a-z]+(?:[\-][A-Z][a-z]+)?(?:\s+[A-Z][a-z]+(?:[\-][A-Z][a-z]+)?)*'
+            r'(?:\s+and\s+[A-Z][a-z]+(?:[\-][A-Z][a-z]+)?(?:\s+[A-Z][a-z]+(?:[\-][A-Z][a-z]+)?)*)*)'
+            r',\s+[A-Z][a-z]+',
+            # Name alone (no city)
+            r'^([A-Z][a-z]+(?:[\-][A-Z][a-z]+)?(?:\s+[A-Z][a-z]+(?:[\-][A-Z][a-z]+)?)*'
+            r'(?:\s+and\s+[A-Z][a-z]+(?:[\-][A-Z][a-z]+)?(?:\s+[A-Z][a-z]+(?:[\-][A-Z][a-z]+)?)*)*)\s*$',
+            # "By Name" format
+            r'^By\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+        ]
+
         for pattern in author_patterns:
             match = re.match(pattern, first_paragraph)
             if match:
                 author_name = match.group(1).strip()
-                # Clean up common suffixes
-                author_name = re.sub(r',.*$', '', author_name)  # Remove location part
+                author_name = re.sub(r',.*$', '', author_name)
                 return author_name
-        
-        # If first paragraph looks like author names (all caps start, short), use it
-        if (len(first_paragraph) < 60 and 
-            re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*', first_paragraph)):
+
+        # Last resort: short title-case paragraph without article-like words
+        if (len(first_paragraph) < 60 and
+                re.match(r'^[A-Z][a-z]+', first_paragraph) and
+                not any(w in first_paragraph.lower() for w in
+                        ['the ', ' of ', ' in ', ' to ', ' a ', ' and '])):
             return first_paragraph.strip()
-        
+
         return ''
-    
+
+    # =========================================================================
+    # CONTENT CLEANING + HTML GENERATION
+    # =========================================================================
+
     def _clean_content_text(self, body_story: Dict[str, Any]) -> str:
-        """Clean and extract main content from body story - PLAIN TEXT VERSION"""
+        """Plain text content with author paragraph removed"""
         paragraphs = body_story.get('paragraphs', [])
         if not paragraphs:
             return ''
-        
+
+        extracted_author = self._extract_author_from_body(body_story)
         cleaned_paragraphs = []
         first_para = paragraphs[0].strip()
-        
-        # Extract the author first to know exactly what to remove
-        extracted_author = self._extract_author_from_body(body_story)
-        
+
         if extracted_author:
-            # Remove the author and location pattern from the first paragraph
             cleaned_first = self._remove_exact_author_from_paragraph(first_para, extracted_author)
-            
-            # Only add cleaned first paragraph if it has substantial content left
             if cleaned_first and len(cleaned_first.strip()) > 10:
                 cleaned_paragraphs.append(cleaned_first.strip())
-            
-            # Add remaining paragraphs
             for i in range(1, len(paragraphs)):
                 para = paragraphs[i].strip()
                 if para:
                     cleaned_paragraphs.append(para)
         else:
-            # No author found, keep all paragraphs
             cleaned_paragraphs = [p.strip() for p in paragraphs if p.strip()]
-        
+
         return '\n'.join(cleaned_paragraphs)
-    
+
     def _generate_rich_content_html(self, body_story: Dict[str, Any]) -> str:
-        """Generate WordPress-ready HTML content with preserved InDesign formatting"""
+        """Generate WordPress-ready HTML with preserved InDesign formatting"""
         story_id = body_story.get('story_id', 'unknown')
         content_elements = body_story.get('content_elements', [])
-        
+
         if not content_elements:
-            print(f"[DEBUG] Story {story_id}: No content_elements found - returning empty HTML")
             return ''
-        
-        print(f"\n[DEBUG] Processing story {story_id}")
-        print(f"[DEBUG] Total content_elements: {len(content_elements)}")
-        
-        # Extract the author first to know exactly what to remove from elements
+
         extracted_author = self._extract_author_from_body(body_story)
-        
-        print(f"[DEBUG] Extracted author: '{extracted_author}'")
-        
-        # Track paragraph boundaries using the paragraph style ranges
         para_ranges = self._group_elements_by_paragraph(content_elements)
-        
-        print(f"[DEBUG] Paragraph ranges: {len(para_ranges)}")
-        
         html_paragraphs = []
-        
-        para_index = 0
-        for para_elements in para_ranges:
-            para_index += 1
+
+        for para_index, para_elements in enumerate(para_ranges, start=1):
             paragraph_html_parts = []
             paragraph_text_parts = []
-            
+
             for element in para_elements:
                 text_content = element['text'].strip()
                 if not text_content:
                     continue
-                
-                # Build plain text version for author detection
                 paragraph_text_parts.append(text_content)
-                
-                # Generate HTML with formatting
-                html_text = self._wrap_text_with_formatting(text_content, element)
-                paragraph_html_parts.append(html_text)
-            
-            # Join the current paragraph parts
+                paragraph_html_parts.append(
+                    self._wrap_text_with_formatting(text_content, element)
+                )
+
             paragraph_text = ' '.join(paragraph_text_parts)
             paragraph_html = ''.join(paragraph_html_parts)
-            
-            # Check if this is author paragraph
-            is_author_para = extracted_author and self._is_author_paragraph(paragraph_text, extracted_author)
-            print(f"[DEBUG] Para {para_index}: text='{paragraph_text[:50]}...' | is_author={is_author_para} | html_len={len(paragraph_html)}")
-            
-            # Skip if this paragraph is just author information
+
+            is_author_para = (
+                extracted_author and
+                self._is_author_paragraph(paragraph_text, extracted_author)
+            )
+
             if is_author_para:
-                print(f"[DEBUG]   → Skipped (matches author pattern)")
                 continue
-                
-            # Add non-empty paragraphs
+
             if paragraph_html.strip():
                 html_paragraphs.append(f'<p>{paragraph_html}</p>')
-                print(f"[DEBUG]   → Added to HTML")
-            else:
-                print(f"[DEBUG]   → Skipped (empty HTML after formatting)")
-        
-        final_html = '\n'.join(html_paragraphs)
-        print(f"[DEBUG] Final HTML length: {len(final_html)} chars | Paragraphs: {len(html_paragraphs)}")
-        print(f"[DEBUG] Story {story_id} complete\n")
-        
-        return final_html
-    
-    def _group_elements_by_paragraph(self, content_elements: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-        """Group content elements by paragraph boundaries"""
+
+        return '\n'.join(html_paragraphs)
+
+    def _group_elements_by_paragraph(
+        self, content_elements: List[Dict[str, Any]]
+    ) -> List[List[Dict[str, Any]]]:
+        """Group content elements by paragraph boundary (paragraph_range_index)"""
         paragraphs = []
-        current_paragraph = []
-        current_para_index = None
-        
+        current_paragraph: List[Dict[str, Any]] = []
+        current_index = None
+
         for element in content_elements:
-            para_index = element.get('paragraph_range_index', 0)
-            
-            # If paragraph index changes, start a new paragraph
-            if current_para_index is not None and para_index != current_para_index:
+            idx = element.get('paragraph_range_index', 0)
+            if current_index is not None and idx != current_index:
                 if current_paragraph:
                     paragraphs.append(current_paragraph)
                 current_paragraph = []
-            
             current_paragraph.append(element)
-            current_para_index = para_index
-        
-        # Add the last paragraph
+            current_index = idx
+
         if current_paragraph:
             paragraphs.append(current_paragraph)
-        
+
         return paragraphs
-    
+
     def _wrap_text_with_formatting(self, text: str, element: Dict[str, Any]) -> str:
-        """Convert InDesign formatting to WordPress-compatible HTML tags"""
+        """Convert InDesign formatting to HTML tags"""
         html_text = text
-        
-        # STEP 1: Apply bold formatting
-        if element.get('is_bold', False):
-            html_text = f'<strong>{html_text}</strong>'
-        
-        # STEP 2: Apply italic formatting
-        if element.get('is_italic', False):
-            html_text = f'<em>{html_text}</em>'
-        
-        # STEP 3: Handle special font sizes
         font_size = element.get('font_size', 12)
-        
-        # If font is significantly larger than body text, treat as subheading
-        if font_size >= 16 and not element.get('is_bold', False):
-            html_text = f'<h4>{html_text}</h4>'
-        elif font_size >= 20:
-            html_text = f'<h3>{html_text}</h3>'
-        
+
+        if element.get('is_bold'):
+            html_text = f'<strong>{html_text}</strong>'
+
+        if element.get('is_italic'):
+            html_text = f'<em>{html_text}</em>'
+
+        # Subheadings: only for non-bold large text (headlines are handled separately)
+        if not element.get('is_bold'):
+            if font_size >= 20:
+                html_text = f'<h3>{html_text}</h3>'
+            elif font_size >= 16:
+                html_text = f'<h4>{html_text}</h4>'
+
         return html_text
-    
-    def _is_author_paragraph(self, paragraph_text: str, extracted_author: str) -> bool:
-        """Check if this paragraph is just author information that should be removed"""
-        if not extracted_author:
-            return False
-            
-        escaped_author = re.escape(extracted_author)
-        author_patterns = [
-            rf'^{escaped_author}',  # Starts with author name
-            rf'^By\s+{escaped_author}',  # "By Author Name"
-            rf'^{escaped_author},\s+[A-Za-z]+',  # "Author Name, Location"
-        ]
-        
-        for pattern in author_patterns:
-            if re.match(pattern, paragraph_text.strip(), re.IGNORECASE):
-                print(f"[DEBUG]     Author pattern matched: {pattern}")
-                return True
-        
-        return False
-    
-    def _remove_exact_author_from_paragraph(self, paragraph: str, author_name: str) -> str:
-        """Remove the exact author pattern that was extracted"""
-        if not author_name:
-            return paragraph
-            
-        escaped_author = re.escape(author_name)
-        
-        removal_patterns = [
-            rf'^{escaped_author},\s+[A-Za-z]+\s*',
-            rf'^{escaped_author}\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s+[A-Za-z]+\s*',
-            rf'^{escaped_author}\s*',
-            rf'^{escaped_author}\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*',
-        ]
-        
-        cleaned = paragraph
-        for pattern in removal_patterns:
-            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE).strip()
-            if new_cleaned != cleaned:
-                cleaned = new_cleaned
-                break
-        
-        # If the above didn't work, try a more aggressive approach
-        if cleaned == paragraph and author_name:
-            match = re.search(r'\b(The|A|An|In|On|At|For|With|By|After|Before|During|Since|Until|About|Over|Under|Through|Against|Between|Among|Around|Inside|Outside|Upon|Within|Without|From|To|Of|Into|Onto|Across|Down|Up|Off|Out|In)\b', paragraph, re.IGNORECASE)
-            if match:
-                cleaned = paragraph[match.start():].strip()
-        
-        return cleaned
-    
-    def _is_likely_author_line(self, paragraph: str) -> bool:
-        """Check if paragraph is likely just an author line"""
-        paragraph = paragraph.strip()
-        
-        if len(paragraph) < 60:
-            author_patterns = [
-                r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*,\s+[A-Z][a-z]+$',
-                r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*$',
-                r'^By\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*',
-            ]
-            
-            for pattern in author_patterns:
-                if re.match(pattern, paragraph):
-                    return True
-        
-        return False
-    
-    def _remove_author_from_paragraph(self, paragraph: str) -> str:
-        """Remove author name from beginning of paragraph, return remaining content"""
-        removal_patterns = [
-            r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*,\s+[A-Z][a-z]+\s*',
-            r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*\s+',
-            r'^By\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*',
-        ]
-        
-        cleaned = paragraph
-        for pattern in removal_patterns:
-            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE).strip()
-            if cleaned != paragraph:
-                break
-        
-        return cleaned
-    
-    def _find_matching_headline(self, body_story: Dict[str, Any], headlines: List[Dict[str, Any]], used_headlines: set) -> Optional[Dict[str, Any]]:
-        """Find headline that matches the body story using multiple strategies"""
+
+    # =========================================================================
+    # HEADLINE MATCHING
+    # =========================================================================
+
+    def _find_matching_headline(
+        self,
+        body_story: Dict[str, Any],
+        headlines: List[Dict[str, Any]],
+        used_headlines: set,
+    ) -> Optional[Dict[str, Any]]:
+        """Find the headline that best matches a body story"""
         body_id = body_story['story_id']
         body_content = body_story['raw_content'].lower()
-        
-        # Strategy 1: Content similarity
-        content_matches = []
-        for headline in headlines:
-            if headline['story_id'] in used_headlines:
-                continue
-                
-            headline_text = headline['raw_content'].lower()
-            similarity_score = self._calculate_content_similarity(headline_text, body_content)
-            
-            if similarity_score > 0:
-                content_matches.append((headline, similarity_score))
-        
-        content_matches.sort(key=lambda x: x[1], reverse=True)
-        
-        if content_matches and content_matches[0][1] >= 2:
-            return content_matches[0][0]
-        
-        # Strategy 2: ID proximity matching
-        id_matches = []
-        for headline in headlines:
-            if headline['story_id'] in used_headlines:
-                continue
-                
-            distance = self._calculate_id_distance(body_id, headline['story_id'])
-            id_matches.append((headline, distance))
-        
-        id_matches.sort(key=lambda x: x[1])
-        
-        # Strategy 3: Combined scoring
+
         best_match = None
         best_score = -1
-        
+
         for headline in headlines:
             if headline['story_id'] in used_headlines:
                 continue
-                
-            content_score = self._calculate_content_similarity(headline['raw_content'].lower(), body_content)
+
+            content_score = self._calculate_content_similarity(
+                headline['raw_content'].lower(), body_content
+            )
             id_distance = self._calculate_id_distance(body_id, headline['story_id'])
             id_score = max(0, 10 - (id_distance / 10))
-            
-            combined_score = (content_score * 0.7) + (id_score * 0.3)
-            
-            if combined_score > best_score:
-                best_score = combined_score
+            combined = (content_score * 0.7) + (id_score * 0.3)
+
+            if combined > best_score:
+                best_score = combined
                 best_match = headline
-        
-        if best_match and best_score >= 1.0:
-            return best_match
-            
-        return None
-    
+
+        return best_match if best_match and best_score >= 1.0 else None
+
     def _calculate_content_similarity(self, headline: str, content: str) -> float:
-        """Calculate similarity score between headline and content"""
+        """Word overlap score between headline and content"""
+        stop_words = {
+            'this', 'that', 'with', 'from', 'they', 'were', 'been', 'have',
+            'will', 'would', 'could', 'should', 'said', 'says', 'also', 'more',
+            'most', 'much', 'many', 'some', 'very', 'when', 'where', 'what',
+            'which', 'while', 'after', 'before', 'during', 'since', 'until',
+            'about', 'above', 'below', 'between', 'through', 'against',
+        }
+        headline_words = set(re.findall(r'\b[a-z]{4,}\b', headline)) - stop_words
+        content_words = set(re.findall(r'\b[a-z]{4,}\b', content[:300])) - stop_words
         score = 0.0
-        
-        stop_words = {'this', 'that', 'with', 'from', 'they', 'were', 'been', 'have', 'will', 'would', 'could', 'should', 'said', 'says', 'also', 'more', 'most', 'much', 'many', 'some', 'very', 'when', 'where', 'what', 'which', 'while', 'after', 'before', 'during', 'since', 'until', 'about', 'above', 'below', 'between', 'through', 'against'}
-        
-        headline_words = set(re.findall(r'\b[a-z]{4,}\b', headline.lower())) - stop_words
-        content_words = set(re.findall(r'\b[a-z]{4,}\b', content.lower()[:300])) - stop_words
-        
-        common_words = headline_words.intersection(content_words)
-        if len(headline_words) > 0:
-            word_overlap_score = len(common_words) / len(headline_words) * 5
-            score += word_overlap_score
-        
+        if headline_words:
+            score += len(headline_words & content_words) / len(headline_words) * 5
+
         headline_entities = set(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', headline))
         content_entities = set(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', content[:400]))
-        
-        common_entities = headline_entities.intersection(content_entities)
-        entity_score = len(common_entities) * 2
-        score += entity_score
-        
-        important_keywords = ['president', 'minister', 'governor', 'senator', 'chairman', 'commission', 'committee', 'party', 'government', 'assembly', 'court', 'justice', 'university', 'union', 'movement', 'congress', 'forum']
-        
-        for keyword in important_keywords:
-            if keyword in headline.lower() and keyword in content.lower():
+        score += len(headline_entities & content_entities) * 2
+
+        keywords = [
+            'president', 'minister', 'governor', 'senator', 'chairman',
+            'commission', 'committee', 'party', 'government', 'assembly',
+            'court', 'justice', 'university', 'union', 'movement',
+        ]
+        for kw in keywords:
+            if kw in headline and kw in content:
                 score += 1
-        
+
         return score
-    
+
     def _calculate_id_distance(self, id1: str, id2: str) -> float:
-        """Calculate distance between two story IDs"""
+        """Numeric distance between two hex story IDs"""
         try:
-            num1 = re.search(r'(\d+)', id1)
-            num2 = re.search(r'(\d+)', id2)
-            
-            if num1 and num2:
-                val1 = int(num1.group(1))
-                val2 = int(num2.group(1))
-                return abs(val1 - val2)
-        except (ValueError, AttributeError):
-            pass
-        
-        return float('inf')
-    
+            # IDs are hex like 'u1b2fe' — parse the hex number part
+            n1 = int(re.search(r'([0-9a-f]+)', id1.lstrip('u'), re.I).group(1), 16)
+            n2 = int(re.search(r'([0-9a-f]+)', id2.lstrip('u'), re.I).group(1), 16)
+            return abs(n1 - n2)
+        except (AttributeError, ValueError):
+            return float('inf')
+
     def _extract_headline_from_content(self, body_story: Dict[str, Any]) -> str:
-        """Extract potential headline from content if no separate headline found"""
-        content_elements = body_story['content_elements']
-        
-        for elem in content_elements:
+        """Fallback: extract headline-like text from body elements"""
+        for elem in body_story['content_elements']:
             if elem['is_bold'] and elem['font_size'] > 10 and len(elem['text']) < 100:
                 return elem['text']
-        
         paragraphs = body_story.get('paragraphs', [])
         if paragraphs:
-            first_sentence = paragraphs[0].split('.')[0]
-            return first_sentence[:100] + '...' if len(first_sentence) > 100 else first_sentence
-            
+            first = paragraphs[0].split('.')[0]
+            return (first[:100] + '...') if len(first) > 100 else first
         return ''
-    
-    def _looks_like_author_line(self, text: str) -> bool:
-        """Check if text looks like an author line"""
-        author_patterns = [
-            r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s+[A-Z][a-z]+',
-            r'^By\s+[A-Z][a-z]+',
+
+    # =========================================================================
+    # AUTHOR / CONTENT HELPERS
+    # =========================================================================
+
+    def _is_author_paragraph(self, paragraph_text: str, extracted_author: str) -> bool:
+        """Check if paragraph is just the author byline"""
+        if not extracted_author:
+            return False
+        escaped = re.escape(extracted_author)
+        patterns = [
+            rf'^{escaped}',
+            rf'^By\s+{escaped}',
+            rf'^{escaped},\s+[A-Za-z]+',
         ]
-        
-        for pattern in author_patterns:
-            if re.match(pattern, text.strip()):
+        for pattern in patterns:
+            if re.match(pattern, paragraph_text.strip(), re.IGNORECASE):
                 return True
         return False
 
-    def _determine_article_type(self, content_elements: List[Dict[str, Any]]) -> str:
-        """Determine if this is a headline, caption, body text, etc."""
-        if not content_elements:
-            return 'unknown'
-        
-        avg_font_size = sum(elem['font_size'] for elem in content_elements) / len(content_elements)
-        has_bold = any(elem['is_bold'] for elem in content_elements)
-        text_length = sum(len(elem['text']) for elem in content_elements)
-        
-        if avg_font_size >= 25 and has_bold:
-            return 'main_headline'
-        elif avg_font_size >= 17 and has_bold:
-            return 'secondary_headline'
-        elif avg_font_size >= 12 and text_length > 200:
-            return 'body_text'
-        elif 'Caption' in str(content_elements[0].get('applied_style', '')):
-            return 'caption'
-        elif text_length < 50:
-            return 'short_text'
-        else:
-            return 'content'
-    
-    def _extract_article_components(self, content_elements: List[Dict[str, Any]], full_text: str) -> Dict[str, str]:
-        """Extract headline, author, and content from the elements"""
-        components = {'headline': '', 'author': '', 'content': ''}
-        
-        author_patterns = [
-            r'By\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
-            r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s+[A-Z][a-z]+$',
-            r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+[A-Z][a-z]+,\s+[A-Z][a-z]+$',
+    def _remove_exact_author_from_paragraph(self, paragraph: str, author_name: str) -> str:
+        """Remove the author byline from the start of a paragraph"""
+        if not author_name:
+            return paragraph
+        escaped = re.escape(author_name)
+        patterns = [
+            rf'^{escaped},\s+[A-Za-z]+\s*',
+            rf'^{escaped}\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s+[A-Za-z]+\s*',
+            rf'^{escaped}\s*',
+            rf'^{escaped}\s+and\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*',
         ]
-        
-        for pattern in author_patterns:
-            author_match = re.search(pattern, full_text, re.IGNORECASE)
-            if author_match:
-                components['author'] = author_match.group(1)
-                full_text = re.sub(pattern, '', full_text, flags=re.IGNORECASE).strip()
-                break
-        
-        largest_font_elements = sorted(content_elements, key=lambda x: x['font_size'], reverse=True)
-        
-        if largest_font_elements and largest_font_elements[0]['font_size'] > 15:
-            headline_elements = [elem for elem in content_elements 
-                               if elem['font_size'] == largest_font_elements[0]['font_size']]
-            components['headline'] = ' '.join([elem['text'] for elem in headline_elements]).strip()
-            
-            headline_text = components['headline']
-            components['content'] = full_text.replace(headline_text, '').strip()
-        else:
-            components['content'] = full_text
-        
-        return components
-    
+        for pattern in patterns:
+            result = re.sub(pattern, '', paragraph, flags=re.IGNORECASE).strip()
+            if result != paragraph:
+                return result
+
+        # Fallback: find first article word and cut from there
+        match = re.search(
+            r'\b(The|A|An|In|On|At|For|With|By|After|Before|During|Since)\b',
+            paragraph, re.IGNORECASE
+        )
+        if match:
+            return paragraph[match.start():].strip()
+
+        return paragraph
+
+    def _looks_like_author_line(self, text: str) -> bool:
+        patterns = [
+            r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s+[A-Z][a-z]+',
+            r'^By\s+[A-Z][a-z]+',
+        ]
+        for p in patterns:
+            if re.match(p, text.strip()):
+                return True
+        return False
+
     def _is_metadata_content(self, text: str) -> bool:
-        """Check if content is metadata rather than news content"""
+        """Reject date headers, captions, page numbers, and newspaper boilerplate."""
         text = text.strip()
-        
-        metadata_patterns = [
+        if len(text) < 3:
+            return True
+        patterns = [
             r'^news$',
             r'^All stories continued on',
             r'^•L-R:',
             r'^\s*$',
-            r'^MONDAY,.*\d{4}$',
+            r'^(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY),.*\d{4}',
             r'^\d{1,2}$',
             r'^Photo:',
-            r'^Continued from'
+            r'^Continued from',
+            # Newspaper boilerplate / disclaimer lines
+            r'^We,\s+Punch',
+            r'^Printed and Published by',
+            r'^Round-the-clock advert',
+            r'^E-mail:yourviews',
+            r'^Puzzle on Page',
+            r'^\+234\d',            # phone number only
+            r'^lekansote@',         # columnist email
+            r'^kunlesomorin@',
+            # Column/section descriptor lines (end with "…" or "...")
+            r'.+[.…]{3}\s*$',
         ]
-        
-        if len(text) < 3:
-            return True
-            
-        for pattern in metadata_patterns:
-            if re.match(pattern, text, re.IGNORECASE):
+        for p in patterns:
+            if re.match(p, text, re.IGNORECASE):
                 return True
         return False
