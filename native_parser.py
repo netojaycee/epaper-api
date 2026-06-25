@@ -40,8 +40,11 @@ SECTION_CODE_MAP: Dict[str, str] = {
     "lagos":        "Lagos",
     "am business":  "Business",
     "247 business": "247 Business",     # subcategory of Business
+    "business":      "Business",
     "business extra": "Business",
     "business opening": "Business",
+    "business&eco":  "Business & Economy",
+    "biz&eco":       "Business & Economy",
     "stock page":   "Stock Market",
     "photonews":    "Photo News",
     "special feature": "Features",
@@ -65,6 +68,7 @@ class IDMLNewsExtractor:
 
     def __init__(self, idml_file_path: str):
         self.idml_path = idml_file_path
+        self.original_filename: str = ''          # set by caller when path is a temp file
         self.namespace = {'idPkg': 'http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging'}
         self.extracted_images: List[bytes] = []   # populated during extract_news_articles()
         self.document_name: str = ''              # original .indd filename from designmap
@@ -98,7 +102,7 @@ class IDMLNewsExtractor:
             # STEP 2: Category — multi-strategy detection
             # ------------------------------------------------------------------
             filename_category = self._extract_category_from_filename(
-                self.document_name or self.idml_path
+                self.original_filename or self.document_name or self.idml_path
             )
             print(f"[DEBUG] Category from filename raw: '{filename_category}'")
 
@@ -129,7 +133,10 @@ class IDMLNewsExtractor:
             # ------------------------------------------------------------------
             # STEP 4: Scan stories for category signals (markers + section headers)
             # ------------------------------------------------------------------
-            section_header_category = ''   # large-font decorative section header
+            # Collect ALL large-font section header candidates in story order.
+            # We combine consecutive ones (e.g. "business" 17pt + "economy" 35pt
+            # → "business & economy") before falling back to largest-only.
+            section_header_candidates = []   # list of (story_index, story_id, text, size)
             all_markers = []
 
             for i, story_file in enumerate(story_files):
@@ -141,13 +148,10 @@ class IDMLNewsExtractor:
                         continue
                     story_id = story_el.get('Self', '')
 
-                    # Large-font section header (e.g. "metro" at 119pt)
-                    if not section_header_category:
-                        sh = self._extract_section_header_category(root)
-                        if sh:
-                            section_header_category = sh
-                            marker_story_ids.add(story_id)
-                            print(f"[DEBUG] Section header category: '{sh}' (id={story_id})")
+                    sh, sh_size = self._extract_section_header_category(root)
+                    if sh:
+                        section_header_candidates.append((i, story_id, sh, sh_size))
+                        print(f"[DEBUG] Section header candidate: '{sh}' ({sh_size:.1f}pt, id={story_id})")
 
                     # Traditional single-text marker (must have letters, not just a number)
                     if self._is_category_marker(root):
@@ -157,6 +161,39 @@ class IDMLNewsExtractor:
 
                 except Exception as e:
                     print(f"[DEBUG] Error scanning {story_file}: {e}")
+
+            # Build section_header_category from candidates:
+            # If multiple candidates are within 10 story-slots of each other,
+            # combine them in story order (e.g. "business" + "economy" → "business & economy").
+            # Otherwise fall back to the single largest-font candidate.
+            section_header_category = ''
+            if section_header_candidates:
+                if len(section_header_candidates) == 1:
+                    section_header_category = section_header_candidates[0][2]
+                    marker_story_ids.add(section_header_candidates[0][1])
+                else:
+                    # Group candidates that are close together in story order
+                    grouped = [section_header_candidates[0]]
+                    for cand in section_header_candidates[1:]:
+                        if cand[0] - grouped[-1][0] <= 10:
+                            grouped.append(cand)
+                        else:
+                            break  # gap too large — stop grouping
+                    for _, sid, _, _ in grouped:
+                        marker_story_ids.add(sid)
+                    if len(grouped) > 1:
+                        # Combine in story order, deduplicate words
+                        words = []
+                        for _, _, text, _ in grouped:
+                            if text.lower() not in [w.lower() for w in words]:
+                                words.append(text)
+                        section_header_category = ' & '.join(words)
+                        print(f"[DEBUG] Combined section header: '{section_header_category}'")
+                    else:
+                        # Only one in the group — use largest font among all candidates
+                        best = max(section_header_candidates, key=lambda x: x[3])
+                        section_header_category = best[2]
+                        marker_story_ids.add(best[1])
 
             # Collect first consecutive sequence of non-numeric markers
             if all_markers:
@@ -173,7 +210,10 @@ class IDMLNewsExtractor:
                     detected_category = ''.join(category_parts)
                     print(f"[DEBUG] Category from markers: '{detected_category}'")
 
-            # Priority: mapped filename > section header > raw filename > marker
+            # Priority: mapped filename > section header > raw filename > markers
+            # Explicit map always wins. Section header is tried before raw filename
+            # because short raw names like "News" fuzzy-match poorly in WordPress,
+            # while the large-font section header text is more specific.
             final_category = (
                 self._map_section_code(filename_category)
                 or section_header_category
@@ -609,49 +649,50 @@ class IDMLNewsExtractor:
                 return name
         return ''
 
-    def _extract_section_header_category(self, root: ET.Element) -> str:
+    def _extract_section_header_category(self, root: ET.Element):
         """
         Detect large-font decorative section headers like the 119pt 'metro' story.
-        These are single-paragraph stories with very large font size and short text.
-        Must have at least 3 letters and NOT be a page number or date.
+        Returns (text, font_size) so the caller can pick the largest-font candidate
+        when multiple section headers exist on the same page.
+        Returns ('', 0.0) when no valid header is found.
         """
         para_ranges = root.findall(".//ParagraphStyleRange")
         if len(para_ranges) != 1:
-            return ''
+            return '', 0.0
 
         char_ranges = para_ranges[0].findall(".//CharacterStyleRange")
         if len(char_ranges) != 1:
-            return ''
+            return '', 0.0
 
         contents = char_ranges[0].findall("Content")
         if len(contents) != 1 or not contents[0].text:
-            return ''
+            return '', 0.0
 
         text = contents[0].text.strip()
         if not text or len(text) > 30:
-            return ''
+            return '', 0.0
 
         # Must have at least 3 letters (rejects page numbers like "5", "4")
         letters = [c for c in text if c.isalpha()]
         if len(letters) < 3:
-            return ''
+            return '', 0.0
 
         # Section headers are simple category names — reject headlines that contain
         # question marks, exclamation marks, digits in parens, or en-dashes
         if re.search(r'[?!–—]|\(\d+\)', text):
-            return ''
+            return '', 0.0
 
         # Must have large font size (section header visual style)
         size_str = char_ranges[0].get('PointSize', '0')
         try:
             size = float(size_str)
         except (ValueError, TypeError):
-            return ''
+            return '', 0.0
 
         if size >= 30:
-            return text.strip()
+            return text.strip(), size
 
-        return ''
+        return '', 0.0
 
     def _looks_like_person_name(self, text: str) -> bool:
         """

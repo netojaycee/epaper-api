@@ -1,5 +1,6 @@
 import io
 import re
+import html
 import requests
 from typing import Dict, Any, Optional, List
 import logging
@@ -29,6 +30,12 @@ WP_MEDIA_URL = settings.wp_media_url
 # Cache for categories and authors
 _CATEGORIES_CACHE = None
 _AUTHORS_CACHE = None
+
+def normalize_category(name: str) -> str:
+    """Decode HTML entities and normalize & ↔ and for consistent matching."""
+    name = html.unescape(name)          # &amp; → &, &nbsp; → space, etc.
+    name = re.sub(r'\s*&\s*', ' and ', name)  # "Business & Economy" → "Business and Economy"
+    return name.lower().strip()
 
 def similarity_ratio(a: str, b: str) -> float:
     """Calculate similarity between two strings (0-1)"""
@@ -64,9 +71,9 @@ def fetch_all_categories() -> Dict[str, Any]:
         
         for cat in categories_data:
             cat_id = cat["id"]
-            cat_name = cat["name"].lower()
+            cat_name = normalize_category(cat["name"])
             parent_id = cat.get("parent", 0)
-            
+
             # Store in flat and all_categories
             flat[cat_name] = cat_id
             all_categories[cat_id] = {
@@ -74,7 +81,7 @@ def fetch_all_categories() -> Dict[str, Any]:
                 "parent": parent_id,
                 "id": cat_id
             }
-            
+
             # If it's a parent category (parent_id == 0), store it
             if parent_id == 0:
                 parent_categories[cat_name] = cat_id
@@ -189,7 +196,7 @@ def get_category_id(article_category: str) -> int:
         logger.warning("No categories fetched from WordPress, using Uncategorized (ID: 1)")
         return 1
     
-    category_lower = article_category.lower().strip()
+    category_lower = normalize_category(article_category)
     logger.info(f"Looking for category (normalized): '{category_lower}'")
     
     flat_categories = cat_data['flat']
@@ -442,7 +449,7 @@ def get_author_ids(author_string: str) -> List[int]:
         # Check if this is the default ID (meaning no match found)
         default_id = get_default_author_id()
         
-        if author_id == default_id and author_name.lower().strip() != 'jaycee':
+        if author_id == default_id and author_name.lower().strip() not in fetch_all_authors():
             # This author wasn't matched
             unmatched_authors.append(author_name)
         else:
@@ -572,8 +579,9 @@ def post_to_wordpress(article: Dict[str, Any]) -> Dict[str, Any]:
         r.raise_for_status()
         response_data = r.json()
         post_id = response_data.get("id")
+        post_slug = response_data.get("slug")
 
-        logger.info(f"✓ Posted! Post ID: {post_id} | Link: {response_data.get('link')}")
+        logger.info(f"✓ Posted! Post ID: {post_id} | Slug: {post_slug} | Link: {response_data.get('link')}")
 
         # Store co-authors in custom post meta so functions.php can read them
         if len(author_ids) > 1 and post_id:
@@ -594,6 +602,7 @@ def post_to_wordpress(article: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "success": True,
             "post_id": post_id,
+            "slug": post_slug,
             "status": response_data.get("status"),
             "link": response_data.get("link"),
             "category_id": category_id,
@@ -617,6 +626,22 @@ def post_to_wordpress(article: Dict[str, Any]) -> Dict[str, Any]:
             "success": False,
             "error": f"Unexpected error: {str(e)}"
         }
+
+
+def trash_wordpress_post(post_id: int) -> bool:
+    """Move a WordPress post to Trash (recoverable). Returns True on success."""
+    try:
+        r = requests.delete(
+            f"{WP_URL}/{post_id}",
+            auth=(WP_USER, WP_APP_PASSWORD),
+            timeout=30,
+        )
+        r.raise_for_status()
+        logger.info(f"✓ Trashed post ID: {post_id}")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not trash post {post_id}: {e}")
+        return False
 
 
 def clear_cache():

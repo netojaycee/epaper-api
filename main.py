@@ -1,17 +1,33 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tempfile
 import os
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
 from config import settings
 from native_parser import IDMLNewsExtractor
-from wordpress import post_to_wordpress, fetch_all_authors, fetch_all_categories, clear_cache
+from wordpress import post_to_wordpress, trash_wordpress_post, fetch_all_authors, fetch_all_categories, clear_cache
 
 load_dotenv()
+
+# ============================================================================
+# COVER PAGE FILTER — filenames matching these patterns are skipped entirely
+# (city editions / front pages should never be posted to WordPress)
+# ============================================================================
+_COVER_PATTERNS = [
+    re.compile(r'lagos',           re.IGNORECASE),
+    re.compile(r'abuja',           re.IGNORECASE),
+    re.compile(r'port.?harcourt',  re.IGNORECASE),
+    re.compile(r'\bph\b',          re.IGNORECASE),
+]
+
+def is_cover_page(filename: str) -> bool:
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return any(p.search(stem) for p in _COVER_PATTERNS)
+
 
 app = FastAPI(title="IDML News Extractor API", version="2.0.0")
 
@@ -107,16 +123,27 @@ async def clear_cache_endpoint():
 
 
 @app.post("/extract-native/")
-async def extract_native(file: UploadFile = File(...)):
+async def extract_native(
+    file: UploadFile = File(...),
+    trash_post_ids: Optional[str] = Form(None),
+):
     """
     Main pipeline endpoint:
     1. Accept .idml upload
-    2. Parse: headlines, authors, category (from filename), content HTML, images
-    3. Post each article to WordPress as draft (if WORDPRESS_ENABLE_POSTING=true)
-    4. Return full results JSON
+    2. If trash_post_ids supplied, move those WP drafts to Trash first (update flow)
+    3. Parse: headlines, authors, category (from filename), content HTML, images
+    4. Post each article to WordPress as draft (if WORDPRESS_ENABLE_POSTING=true)
+    5. Return full results JSON including new post IDs for watcher to store
     """
     if not file.filename.lower().endswith(".idml"):
         raise HTTPException(status_code=400, detail="File must be an .idml file")
+
+    if is_cover_page(file.filename):
+        return {
+            "success": False,
+            "skipped": True,
+            "reason": f"Cover/city-edition page ignored: {file.filename}",
+        }
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".idml") as tmp:
         tmp.write(await file.read())
@@ -124,13 +151,26 @@ async def extract_native(file: UploadFile = File(...)):
 
     try:
         extractor = IDMLNewsExtractor(temp_path)
+        extractor.original_filename = file.filename or ''
         articles = extractor.extract_news_articles()
+
+        # ----------------------------------------------------------------
+        # TRASH OLD DRAFTS (update flow — watcher sends previous post IDs)
+        # ----------------------------------------------------------------
+        trashed_ids = []
+        if trash_post_ids and settings.wp_enable_posting:
+            for pid_str in trash_post_ids.split(","):
+                pid_str = pid_str.strip()
+                if pid_str.isdigit():
+                    if trash_wordpress_post(int(pid_str)):
+                        trashed_ids.append(int(pid_str))
 
         # ----------------------------------------------------------------
         # POST TO WORDPRESS (only if enabled in .env)
         # ----------------------------------------------------------------
         posted = []
         wordpress_errors = []
+        all_new_post_ids = []
 
         if settings.wp_enable_posting:
             for article in articles:
@@ -142,9 +182,11 @@ async def extract_native(file: UploadFile = File(...)):
                 ):
                     result = post_to_wordpress(article)
                     if result.get("success"):
+                        all_new_post_ids.append(str(result.get("post_id")))
                         posted.append({
                             "headline": article["headline"],
                             "post_id": result.get("post_id"),
+                            "slug": result.get("slug"),
                             "status": result.get("status"),
                             "link": result.get("link"),
                             "category": article.get("category", "unknown"),
@@ -202,6 +244,8 @@ async def extract_native(file: UploadFile = File(...)):
                 "posting_enabled": settings.wp_enable_posting,
                 "posted": len(posted),
                 "failed": len(wordpress_errors),
+                "post_ids": ",".join(all_new_post_ids),
+                "trashed_ids": trashed_ids or None,
                 "posted_articles": posted,
                 "errors": wordpress_errors or None,
             },
