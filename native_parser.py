@@ -34,9 +34,8 @@ SECTION_CODE_MAP: Dict[str, str] = {
     "dap":          "Metro",
     "spill":        "News",
     "healthplus":   "HealthPlus",       # column
-    "healthwise":   "HealthWise",       # opinion
-    "backpage":     "Back Page",
-    "bp":           "Back Page",
+    "healthwise":   "HealthWise",
+    # backpage / bp handled dynamically in _map_section_code (Sat→Sports, else Column)
     "mynews":       "News",
     "lagos":        "Lagos",
     "am business":  "Business",
@@ -442,7 +441,17 @@ class IDMLNewsExtractor:
     def _parse_news_story(self, xml_content: bytes, filename: str) -> Optional[Dict[str, Any]]:
         """Parse individual story XML and extract structured content"""
         try:
-            root = ET.fromstring(xml_content)
+            try:
+                root = ET.fromstring(xml_content)
+            except ET.ParseError:
+                # Recover: re-encode as CP1252 → UTF-8 for Windows-1252 bytes in XML
+                try:
+                    recovered = xml_content.decode('cp1252', errors='replace').encode('utf-8')
+                    root = ET.fromstring(recovered)
+                    print(f"[DEBUG] CP1252 recovery applied: {filename}")
+                except Exception as e:
+                    print(f"[DEBUG] XML parse error in {filename}: {e}")
+                    return None
             story_el = root.find('.//Story')
             if story_el is None:
                 return None
@@ -516,6 +525,11 @@ class IDMLNewsExtractor:
             raw_content = ' '.join(paragraphs)
             full_text = '\n'.join(paragraphs)
 
+            # Skip stories with garbled encoding (3+ consecutive ? = CP1252 bytes misread)
+            if re.search(r'\?{3,}', raw_content):
+                print(f"[DEBUG] Skipping garbled story (encoding issue): {filename}")
+                return None
+
             return {
                 'story_id': story_el.get('Self', ''),
                 'filename': filename,
@@ -526,8 +540,8 @@ class IDMLNewsExtractor:
                 'category': category,
             }
 
-        except ET.ParseError as e:
-            print(f"[DEBUG] XML parse error in {filename}: {e}")
+        except Exception as e:
+            print(f"[DEBUG] Error parsing story {filename}: {e}")
             return None
 
     # =========================================================================
@@ -583,6 +597,9 @@ class IDMLNewsExtractor:
         if not raw:
             return ''
         key = raw.lower().strip()
+        # BackPage / BP: Saturday edition → Sports, all other days → Column
+        if key.startswith('backpage') or key == 'bp' or key.startswith('bp '):
+            return 'Sports' if 'sat' in key else 'Column'
         # Direct lookup
         if key in SECTION_CODE_MAP:
             return SECTION_CODE_MAP[key]
@@ -735,6 +752,13 @@ class IDMLNewsExtractor:
                 pass
         return attributions
 
+    # Common words that look like valid text but are never category names
+    _NOT_A_CATEGORY = {
+        'the', 'a', 'an', 'and', 'or', 'in', 'on', 'at', 'to', 'of', 'by',
+        'for', 'is', 'it', 'its', 'be', 'was', 'are', 'as', 'up', 'no',
+        'so', 'do', 'go', 'he', 'she', 'we', 'they', 'you', 'but', 'not',
+    }
+
     def _is_valid_category(self, text: str) -> bool:
         """Validate category text"""
         text = text.strip()
@@ -747,6 +771,8 @@ class IDMLNewsExtractor:
         if len(text) < 1 or len(text) > 30:
             return False
         if '@' in text or 'http' in text.lower():
+            return False
+        if text.lower() in self._NOT_A_CATEGORY:
             return False
         return True
 
@@ -874,6 +900,10 @@ class IDMLNewsExtractor:
                         article['author'] = nearest_attr[1]
                         print(f"[DEBUG] Assigned caption author '{nearest_attr[1]}' -> story{article['story_id']}")
 
+        for article in matched_articles:
+            if not article.get('author'):
+                article['author'] = 'Agency Report'
+
         return matched_articles
 
     def _determine_story_type(self, story: Dict[str, Any]) -> str:
@@ -885,12 +915,15 @@ class IDMLNewsExtractor:
             return 'unknown'
 
         avg_font_size = sum(e['font_size'] for e in content_elements) / len(content_elements)
+        max_font_size = max(e['font_size'] for e in content_elements)
         has_bold = any(e['is_bold'] for e in content_elements)
         text_length = len(raw_content)
         paragraph_count = len(story.get('paragraphs', []))
 
-        # Headlines: large font, bold, short, single paragraph
-        if avg_font_size >= 15 and has_bold and text_length < 150 and paragraph_count <= 2:
+        # Headlines: use MAX font size so kicker+headline layouts (where a small kicker
+        # pulls the average below 15pt) are still caught.  Allows up to 3 paragraphs
+        # (kicker / main head / deck) and up to 250 chars.
+        if max_font_size >= 15 and has_bold and text_length < 250 and paragraph_count <= 3:
             # BackPage columns: columnist name is a separate Bold story at ~14-24pt
             # (actual article headlines on BackPage are typically 29pt+)
             if avg_font_size < 25 and self._looks_like_person_name(raw_content):

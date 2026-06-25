@@ -134,7 +134,12 @@ async def extract_native(file: UploadFile = File(...)):
 
         if settings.wp_enable_posting:
             for article in articles:
-                if article.get("content_html"):
+                content_html = article.get("content_html", "")
+                if (
+                    article.get("article_type") != "standalone_headline"
+                    and content_html
+                    and len(content_html) > 200
+                ):
                     result = post_to_wordpress(article)
                     if result.get("success"):
                         posted.append({

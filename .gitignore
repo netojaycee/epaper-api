@@ -6,6 +6,10 @@ dist/
 wheels/
 *.egg-info
 
+old/
+_insp_lagos.py
+
+
 # Virtual environments
 .venv
 venv/
